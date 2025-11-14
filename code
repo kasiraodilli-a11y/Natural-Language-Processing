@@ -1,0 +1,186 @@
+ ============================================================
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.ensemble import VotingClassifier
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+TRAIN = "/content/drive/MyDrive/NLP project/train.tsv"
+LABELS_TRAIN = "/content/drive/MyDrive/NLP project/TrainLabels.tsv"
+DEV = "/content/drive/MyDrive/NLP project/dev.tsv"
+LABELS_DEV = "/content/drive/MyDrive/NLP project/DevLabels.tsv"
+
+train_df = pd.read_csv(TRAIN, sep="\t")
+labels_df = pd.read_csv(LABELS_TRAIN, sep="\t")
+dev_df = pd.read_csv(DEV, sep="\t")
+labels_dev_df = pd.read_csv(LABELS_DEV, sep="\t")
+
+print("Train Shape:", train_df.shape)
+print("Label Shape:", labels_df.shape)
+
+
+# ============================================================
+# 2. RESHAPE TRAIN DATA (WIDE → LONG)
+# ============================================================
+
+def reshape_to_long(df):
+    fillers = []
+    for i in range(1, 6):
+        temp = df.copy()
+        temp["FillerNum"] = f"Filler{i}"
+        temp["Candidate"] = temp[f"Filler{i}"]
+        fillers.append(temp)
+    return pd.concat(fillers, axis=0, ignore_index=True)
+
+long_train = reshape_to_long(train_df)
+long_dev = reshape_to_long(dev_df)
+
+# ============================================================
+# 3. MERGE GOLD LABELS
+# ============================================================
+
+labels_df["Id_Filler"] = labels_df["1_1"]
+labels_df[["Id", "Num"]] = labels_df["Id_Filler"].str.split("_", expand=True)
+
+labels_df["FillerNum"] = labels_df["Num"].apply(lambda x: f"Filler{x}")
+labels_df["Label"] = labels_df["PLAUSIBLE"].apply(lambda x: 1 if x == "PLAUSIBLE" else 0)
+
+# Merge into long train
+merged_train = long_train.merge(labels_df[["Id", "FillerNum", "Label"]], on=["Id", "FillerNum"], how="left")
+
+# Merge dev labels
+labels_dev_df["Id_Filler"] = labels_dev_df["1_1"]
+labels_dev_df[["Id", "Num"]] = labels_dev_df["Id_Filler"].str.split("_", expand=True)
+labels_dev_df["FillerNum"] = labels_dev_df["Num"].apply(lambda x: f"Filler{x}")
+labels_dev_df["Label"] = labels_dev_df["PLAUSIBLE"].apply(lambda x: 1 if x == "PLAUSIBLE" else 0)
+
+merged_dev = long_dev.merge(labels_dev_df[["Id", "FillerNum", "Label"]], on=["Id", "FillerNum"], how="left")
+
+print("Merged Train Shape:", merged_train.shape)
+print("Merged Dev Shape:", merged_dev.shape)
+
+
+# ============================================================
+# 4. PRE-PROCESSING
+# ============================================================
+
+def build_text(row):
+    return f"{row['Previous context']} {row['Sentence']} {row['Follow-up context']} [SEP] {row['Candidate']}"
+
+merged_train["text"] = merged_train.apply(build_text, axis=1)
+merged_dev["text"] = merged_dev.apply(build_text, axis=1)
+
+X = merged_train["text"].fillna("")
+y = merged_train["Label"]
+
+X_dev = merged_dev["text"].fillna("")
+y_dev = merged_dev["Label"]
+
+
+# ============================================================
+# 5. BUILD FEATURE SETS
+# ============================================================
+
+word_tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=30000)
+char_tfidf = TfidfVectorizer(analyzer="char", ngram_range=(3, 5), max_features=50000)
+
+hybrid_features = FeatureUnion([
+    ("word", word_tfidf),
+    ("char", char_tfidf)
+])
+
+
+# ============================================================
+# 6. DEFINE MODELS
+# ============================================================
+
+lr_balanced = LogisticRegression(max_iter=3000, class_weight="balanced")
+svm_balanced = LinearSVC(class_weight="balanced")
+
+ensemble = VotingClassifier(
+    estimators=[
+        ("lr", LogisticRegression(max_iter=3000)),
+        ("svm", LinearSVC())
+    ],
+    voting="hard"
+)
+
+
+# ============================================================
+# 7. TRAIN/TEST SPLIT FOR INTERNAL VALIDATION
+# ============================================================
+
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.20, stratify=y, random_state=42)
+
+
+# ============================================================
+# 8. RUN EXPERIMENTS
+# ============================================================
+
+def run_experiment(model, features, title):
+    pipe = Pipeline([
+        ("features", features),
+        ("clf", model)
+    ])
+    pipe.fit(X_train, y_train)
+
+    preds = pipe.predict(X_val)
+    print(f"\n=========== {title} ===========\n")
+    print("Accuracy:", accuracy_score(y_val, preds))
+    print(classification_report(y_val, preds))
+    return pipe
+
+
+# ---- Run All Experiments ----
+model_word_svm = run_experiment(svm_balanced, word_tfidf, "Word TF-IDF + SVM (Balanced)")
+model_char_lr = run_experiment(lr_balanced, char_tfidf, "Char TF-IDF + LR (Balanced)")
+model_hybrid_svm = run_experiment(svm_balanced, hybrid_features, "Hybrid (Word + Char) TF-IDF + SVM (Balanced)")
+model_ensemble = run_experiment(ensemble, hybrid_features, "Ensemble Voting")
+
+
+# ============================================================
+# 9. FINAL EVALUATION ON DEV SET (BEST MODEL)
+# ============================================================
+
+best_model = model_hybrid_svm
+dev_preds = best_model.predict(X_dev)
+
+print("\n======= FINAL DEV SET EVALUATION =======\n")
+print("Accuracy:", accuracy_score(y_dev, dev_preds))
+print(classification_report(y_dev, dev_preds))
+
+
+# ============================================================
+# 10. SAVE DEV PREDICTIONS
+# ============================================================
+
+os.makedirs("/content/results", exist_ok=True)
+out_path = "/content/results/dev_predictions.csv"
+pd.DataFrame({"Id": merged_dev["Id"], "Prediction": dev_preds}).to_csv(out_path, index=False)
+
+print("Predictions saved to:", out_path)
+
+
+# ============================================================
+# 11. CONFUSION MATRIX PLOT
+# ============================================================
+
+cm = confusion_matrix(y_dev, dev_preds)
+plt.figure(figsize=(6,4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.title("Confusion Matrix – Dev Set")
+plt.xlabel("Predicted")
+plt.ylabel("True Label")
+plt.show()
+
